@@ -9,7 +9,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.AudioTrack
@@ -35,6 +38,16 @@ class PitchShifterService : Service() {
     private var audioTrack: AudioTrack? = null
     private var dspThread: DspThread? = null
     
+    private val audioDeviceCallback = object : AudioDeviceCallback() {
+        override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
+            routeToHeadphones()
+        }
+
+        override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
+            routeToHeadphones()
+        }
+    }
+
     @Volatile
     private var isRunning = false
 
@@ -106,6 +119,10 @@ class PitchShifterService : Service() {
         // Setup Audio Capture and Audio Track
         setupAudio()
 
+        // Register audio device listener to handle headphone plug/unplug
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        audioManager?.registerAudioDeviceCallback(audioDeviceCallback, null)
+
         // Start Processing Thread
         dspThread = DspThread()
         dspThread?.start()
@@ -164,6 +181,23 @@ class PitchShifterService : Service() {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setBufferSizeInBytes(trackBufferSize)
             .build()
+
+        // Attempt to route to headphones immediately if they are already connected
+        routeToHeadphones()
+    }
+
+    private fun routeToHeadphones() {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        
+        val headphoneDevice = devices.find {
+            it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+            it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+        }
+
+        audioTrack?.setPreferredDevice(headphoneDevice) // null will reset to default routing
     }
 
     fun setSemitoneShift(semitones: Int) {
@@ -217,6 +251,9 @@ class PitchShifterService : Service() {
             e.printStackTrace()
         }
         
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+        audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
+
         mediaProjection?.stop()
         mediaProjection = null
         stopForeground(true)
