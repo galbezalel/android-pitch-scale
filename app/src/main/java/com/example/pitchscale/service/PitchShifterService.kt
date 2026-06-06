@@ -23,7 +23,7 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import com.example.pitchscale.MainActivity
-import com.example.pitchscale.dsp.PitchShifter
+import com.example.pitchscale.dsp.SoundTouchNative
 import kotlin.math.abs
 
 class PitchShifterService : Service() {
@@ -31,7 +31,10 @@ class PitchShifterService : Service() {
     private val binder = PitchShifterBinder()
     
     private val sampleRate = 44100
-    private val pitchShifter = PitchShifter(sampleRate.toFloat())
+    private val pitchShifter = SoundTouchNative().apply {
+        setSampleRate(sampleRate)
+        setChannels(1)
+    }
 
     private var mediaProjection: MediaProjection? = null
     private var audioRecord: AudioRecord? = null
@@ -201,9 +204,7 @@ class PitchShifterService : Service() {
     }
 
     fun setSemitoneShift(semitones: Int) {
-        // Shifting factor = 2^(semitones / 12)
-        val ratio = Math.pow(2.0, semitones.toDouble() / 12.0).toFloat()
-        pitchShifter.pitchShiftRatio = ratio
+        pitchShifter.setPitchSemiTones(semitones.toFloat())
     }
 
     private fun createNotificationChannel() {

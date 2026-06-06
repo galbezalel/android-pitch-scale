@@ -18,6 +18,12 @@ android {
         vectorDrawables {
             useSupportLibrary = true
         }
+        externalNativeBuild {
+            cmake {
+                cppFlags += "-fexceptions"
+                cppFlags += "-O3"
+            }
+        }
     }
 
     buildTypes {
@@ -38,6 +44,11 @@ android {
     }
     buildFeatures {
         compose = true
+    }
+    externalNativeBuild {
+        cmake {
+            path("src/main/cpp/CMakeLists.txt")
+        }
     }
     composeOptions {
         kotlinCompilerExtensionVersion = "1.5.1"
