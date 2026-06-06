@@ -16,6 +16,9 @@ import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.AudioTrack
+import android.media.VolumeProvider
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.media.projection.MediaProjection
 import android.media.projection.MediaProjectionManager
 import android.os.Binder
@@ -41,13 +44,70 @@ class PitchShifterService : Service() {
     private var audioTrack: AudioTrack? = null
     private var dspThread: DspThread? = null
     
+    private var mediaSession: MediaSession? = null
+    
+    private var originalMediaVolume = -1
+    private var currentUsage = AudioAttributes.USAGE_ALARM
+    @Volatile
+    private var requiresTrackRecreation = false
+    
     private val audioDeviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
-            routeToHeadphones()
+            checkAndUpdateRouting()
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>?) {
-            routeToHeadphones()
+            checkAndUpdateRouting()
+        }
+    }
+    
+    private fun areHeadphonesConnected(): Boolean {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return false
+        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+        return devices.any {
+            it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+            it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
+            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+        }
+    }
+
+    private fun checkAndUpdateRouting() {
+        val hasHeadphones = areHeadphonesConnected()
+        val targetUsage = if (hasHeadphones) {
+            AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY
+        } else {
+            AudioAttributes.USAGE_ALARM
+        }
+
+        if (targetUsage != currentUsage) {
+            currentUsage = targetUsage
+            applyEchoHackVolumes(hasHeadphones)
+            requiresTrackRecreation = true
+        }
+    }
+    
+    private fun applyEchoHackVolumes(hasHeadphones: Boolean) {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        if (originalMediaVolume == -1) {
+            originalMediaVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
+        }
+        
+        val maxMedia = audioManager.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val targetStream = if (hasHeadphones) AudioManager.STREAM_ACCESSIBILITY else AudioManager.STREAM_ALARM
+        val maxTarget = audioManager.getStreamMaxVolume(targetStream)
+        
+        val targetVol = if (maxMedia > 0) ((originalMediaVolume.toFloat() / maxMedia.toFloat()) * maxTarget).toInt() else 0
+        
+        audioManager.setStreamVolume(targetStream, targetVol, 0)
+        audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+    }
+
+    private fun restoreMediaVolume() {
+        if (originalMediaVolume != -1) {
+            val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
+            audioManager?.setStreamVolume(AudioManager.STREAM_MUSIC, originalMediaVolume, 0)
+            originalMediaVolume = -1
         }
     }
 
@@ -125,10 +185,35 @@ class PitchShifterService : Service() {
         // Register audio device listener to handle headphone plug/unplug
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         audioManager?.registerAudioDeviceCallback(audioDeviceCallback, null)
+        
+        setupMediaSession()
 
         // Start Processing Thread
         dspThread = DspThread()
         dspThread?.start()
+    }
+
+    private fun setupMediaSession() {
+        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
+        mediaSession = MediaSession(this, "PitchShifterSession").apply {
+            val playbackState = PlaybackState.Builder()
+                .setState(PlaybackState.STATE_PLAYING, 0, 1.0f)
+                .build()
+            setPlaybackState(playbackState)
+
+            val currentVol = audioManager.getStreamVolume(if (areHeadphonesConnected()) AudioManager.STREAM_ACCESSIBILITY else AudioManager.STREAM_ALARM)
+
+            val volumeProvider = object : VolumeProvider(VOLUME_CONTROL_RELATIVE, 15, currentVol) {
+                override fun onAdjustVolume(direction: Int) {
+                    val targetStream = if (areHeadphonesConnected()) AudioManager.STREAM_ACCESSIBILITY else AudioManager.STREAM_ALARM
+                    audioManager.adjustStreamVolume(targetStream, direction, AudioManager.FLAG_SHOW_UI)
+                    // Aggressively keep the media stream muted to prevent Spotify echo
+                    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0)
+                }
+            }
+            setPlaybackToRemote(volumeProvider)
+            isActive = true
+        }
     }
 
     private fun setupAudio() {
@@ -160,17 +245,25 @@ class PitchShifterService : Service() {
             .setBufferSizeInBytes(bufferSize)
             .build()
 
-        // 3. AudioTrack (for output)
+        // Determine initial usage and volume
+        val hasHeadphones = areHeadphonesConnected()
+        currentUsage = if (hasHeadphones) AudioAttributes.USAGE_ASSISTANCE_ACCESSIBILITY else AudioAttributes.USAGE_ALARM
+        applyEchoHackVolumes(hasHeadphones)
+
+        audioTrack = createAudioTrack()
+    }
+
+    private fun createAudioTrack(): AudioTrack {
         val trackBufferSize = AudioTrack.getMinBufferSize(
             sampleRate,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_16BIT
         ) * 2
 
-        audioTrack = AudioTrack.Builder()
+        return AudioTrack.Builder()
             .setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ALARM)
+                    .setUsage(currentUsage)
                     .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
                     .build()
             )
@@ -184,23 +277,6 @@ class PitchShifterService : Service() {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setBufferSizeInBytes(trackBufferSize)
             .build()
-
-        // Attempt to route to headphones immediately if they are already connected
-        routeToHeadphones()
-    }
-
-    private fun routeToHeadphones() {
-        val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
-        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        
-        val headphoneDevice = devices.find {
-            it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
-            it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
-            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
-            it.type == AudioDeviceInfo.TYPE_USB_HEADSET
-        }
-
-        audioTrack?.setPreferredDevice(headphoneDevice) // null will reset to default routing
     }
 
     fun setSemitoneShift(semitones: Int) {
@@ -254,11 +330,16 @@ class PitchShifterService : Service() {
         
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as? AudioManager
         audioManager?.unregisterAudioDeviceCallback(audioDeviceCallback)
+        
+        mediaSession?.isActive = false
+        mediaSession?.release()
+        mediaSession = null
 
         mediaProjection?.stop()
         mediaProjection = null
         stopForeground(true)
         pitchShifter.dispose()
+        restoreMediaVolume()
     }
 
     private inner class DspThread : Thread("PitchShifterDspThread") {
@@ -266,7 +347,7 @@ class PitchShifterService : Service() {
             android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
 
             val record = audioRecord ?: return
-            val track = audioTrack ?: return
+            var track = audioTrack
 
             val chunkSize = 512
             val recordBuf = ShortArray(chunkSize)
@@ -274,9 +355,21 @@ class PitchShifterService : Service() {
 
             try {
                 record.startRecording()
-                track.play()
+                track?.play()
 
                 while (isRunning) {
+                    if (requiresTrackRecreation) {
+                        requiresTrackRecreation = false
+                        try {
+                            track?.stop()
+                            track?.release()
+                        } catch (e: Exception) {}
+                        
+                        track = createAudioTrack()
+                        audioTrack = track
+                        track?.play()
+                    }
+
                     val readResult = record.read(recordBuf, 0, chunkSize)
                     if (readResult <= 0) continue
 
@@ -295,7 +388,7 @@ class PitchShifterService : Service() {
                     // Run the SoundTouch Pitch Shifter
                     var received = pitchShifter.process(recordBuf, readResult, playBuf)
                     while (received > 0 && isRunning) {
-                        track.write(playBuf, 0, received)
+                        track?.write(playBuf, 0, received)
                         received = pitchShifter.process(ShortArray(0), 0, playBuf)
                     }
                 }
@@ -303,7 +396,7 @@ class PitchShifterService : Service() {
                 // Flush remaining samples on stop
                 var received = pitchShifter.flush(playBuf)
                 while (received > 0) {
-                    track.write(playBuf, 0, received)
+                    track?.write(playBuf, 0, received)
                     received = pitchShifter.flush(playBuf)
                 }
             } catch (e: Exception) {
@@ -316,10 +409,10 @@ class PitchShifterService : Service() {
                     record.release()
                 } catch (e: Exception) {}
                 try {
-                    track.stop()
+                    track?.stop()
                 } catch (e: Exception) {}
                 try {
-                    track.release()
+                    track?.release()
                 } catch (e: Exception) {}
             }
         }

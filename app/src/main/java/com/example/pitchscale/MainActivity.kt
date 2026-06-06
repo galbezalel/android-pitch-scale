@@ -180,6 +180,29 @@ class MainActivity : ComponentActivity() {
         val isRunning by isServiceRunningState
         val semitones by semitonesState
         val amplitude by amplitudeState
+        val showRoutingAlert = remember { mutableStateOf(false) }
+
+        if (showRoutingAlert.value) {
+            AlertDialog(
+                onDismissRequest = { showRoutingAlert.value = false },
+                title = { Text("Audio Routing Notice", color = Color.White) },
+                text = { Text("To eliminate echoes, your media stream (e.g. Spotify) will be muted, and the pitch-shifted audio will play over the Accessibility stream. \n\nEnsure your headphones are connected.", color = Color.LightGray) },
+                confirmButton = {
+                    TextButton(onClick = {
+                        showRoutingAlert.value = false
+                        checkPermissionsAndStart()
+                    }) {
+                        Text("Proceed", color = Color(0xFF00F2FE))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showRoutingAlert.value = false }) {
+                        Text("Cancel", color = Color.Gray)
+                    }
+                },
+                containerColor = Color(0xFF1E1E24)
+            )
+        }
 
         Column(
             modifier = Modifier
@@ -286,7 +309,13 @@ class MainActivity : ComponentActivity() {
                         .fillMaxWidth(0.7f)
                         .clip(RoundedCornerShape(28.dp))
                         .background(powerGradient)
-                        .clickable { toggleService() }
+                        .clickable { 
+                            if (isRunning) {
+                                stopPitchService()
+                            } else {
+                                showRoutingAlert.value = true
+                            }
+                        }
                         .shadow(8.dp, RoundedCornerShape(28.dp)),
                     contentAlignment = Alignment.Center
                 ) {
